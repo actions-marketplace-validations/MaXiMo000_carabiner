@@ -19,8 +19,9 @@ from .engines import ALL
 from .engines import missing as engines_missing
 from .engines import networked as engines_networked
 from .engines import full_only as engines_full_only
+from .engines._tool import error as _engine_error
 from .finding import rank
-from .report import human, sarif
+from .report import gitlab, human, sarif
 
 
 def _collect(root: pathlib.Path, only: list[str] | None, full: bool = False,
@@ -42,7 +43,15 @@ def _collect(root: pathlib.Path, only: list[str] | None, full: bool = False,
         if not full and engines_full_only(name) and not only:
             continue
         if engine.available(root):
-            findings.extend(engine.run(root, full, changed))
+            try:
+                findings.extend(engine.run(root, full, changed))
+            except Exception as exc:  # noqa: BLE001 -- see below
+                # A bug in one engine must not blind every other one, and it
+                # must not report the repo as clean either: the same
+                # "a tool that failed is not a repo that is clean" rule
+                # _tool.error() already enforces for a subprocess that errors
+                # applies just as much to a native engine that raises.
+                findings.append(_engine_error(name, name, str(exc)))
     return [f for f in dedupe(findings) if not cfg.ignored(f)]
 
 
@@ -120,12 +129,23 @@ def _init(root: pathlib.Path, dry_run: bool) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="carabiner")
+    ap = argparse.ArgumentParser(
+        prog="carabiner",
+        description="Make any repository secure by default in one command, "
+                    "keep it that way, and prove the protections actually fire.",
+        epilog="  carabiner init     adopt: detect, configure, ratchet    once per repo\n"
+               "  carabiner scan     what is new since the baseline       pre-commit, CI\n"
+               "  carabiner drill    attack the repo, prove the controls  after init, weekly\n"
+               "  carabiner lock     accept what exists today             deliberate debt\n"
+               "  carabiner debt     what we are carrying                 sprint planning",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["init", "scan", "drill", "lock", "debt"])
     ap.add_argument("--root", type=pathlib.Path, default=pathlib.Path("."))
     ap.add_argument("--engine", action="append", dest="engines")
     ap.add_argument("--fail-on", default=None,
-                    help="override the per-engine threshold from .carabiner.yml")
+                    help="one global threshold for every engine, replacing "
+                         "(not layering on) any per-engine fail_on in "
+                         ".carabiner.yml")
     ap.add_argument("--all", action="store_true", dest="full",
                     help="every engine, whole history. CI cadence, not pre-commit.")
     ap.add_argument("--dry-run", action="store_true", help="init: write nothing")
@@ -140,6 +160,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--sarif", metavar="PATH",
                     help="write SARIF 2.1.0 for GitHub code scanning")
+    ap.add_argument("--gitlab-sast", metavar="PATH",
+                    help="write a GitLab SAST report for the merge request "
+                         "Security widget (report schema 15)")
     ap.add_argument("--summary", metavar="PATH",
                     help="write a short markdown summary for a PR comment")
     ap.add_argument("--expires", type=int, metavar="DAYS",
@@ -256,6 +279,13 @@ def main(argv: list[str] | None = None) -> int:
         pathlib.Path(args.sarif).write_text(sarif.render(findings, __version__), encoding="utf-8")
         print(f"wrote {len(findings)} findings to {args.sarif}")
 
+    if args.gitlab_sast:
+        # Same inventory-not-diff reasoning as --sarif above.
+        from . import __version__
+        pathlib.Path(args.gitlab_sast).write_text(
+            gitlab.render(findings, __version__), encoding="utf-8")
+        print(f"wrote {len(findings)} findings to {args.gitlab_sast}")
+
     if args.json:
         print(json.dumps({"new": [f.as_dict() for f in new],
                           "accepted": len(accepted)}, indent=2))
@@ -264,6 +294,17 @@ def main(argv: list[str] | None = None) -> int:
                            len(gone), hidden))
 
     if args.fail_on:
+        # --fail-on replaces cfg.gate() outright: one global threshold for
+        # every engine, not a floor on top of the per-engine ones. Silent,
+        # that reads as "the config's thresholds still apply, just raised" --
+        # exactly backwards for whichever engine had a *stricter* per-engine
+        # setting than this flag.
+        overridden = sorted(n for n, e in cfg.engines.items()
+                            if isinstance(e, dict) and "fail_on" in e)
+        if overridden:
+            print(f"note: --fail-on {args.fail_on} replaces the per-engine "
+                  f"fail_on in {config.CONFIG_NAME} for: {', '.join(overridden)}",
+                  file=sys.stderr)
         worst = max((rank(f.severity) for f in new), default=-1)
         return 1 if worst >= rank(args.fail_on) else 0
     return cfg.gate(new)

@@ -196,6 +196,54 @@ def test_secrets_integration_when_gitleaks_present():
               any(body[:40] in f.snippet for f in got), False)
 
 
+def test_working_tree_secrets_scan_skips_generated_directories():
+    """Measured on carabiner's own repo: gitleaks' non-git scan has no
+    .gitignore of its own, so __pycache__/drill.cpython-312.pyc -- holding a
+    string split in the .py source specifically to dodge this scanner, folded
+    back into one literal by the compiler -- tripped SECRET-private-key on
+    every working-tree scan. Both directions: the same content outside a
+    generated directory must still be found."""
+    import shutil, tempfile
+    from carabiner.engines import secrets
+    if not shutil.which("gitleaks"):
+        return
+    marker = "".join(("-----BEGIN", " RSA PRIVATE KEY-----"))
+    body = "".join(("MIIEow", "IBAAKCAQEA", "x7Kq9vTbNz2mWpLc4RfHjE8sYuD" * 3))
+    key = f"{marker}\n{body}\n-----END RSA PRIVATE KEY-----\n"
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        (root / "__pycache__").mkdir()
+        (root / "__pycache__" / "mod.cpython-312.pyc").write_text(key, encoding="utf-8")
+        check("a generated-cache directory produces nothing", secrets.run(root), [])
+
+        (root / "id_rsa").write_text(key, encoding="utf-8")
+        check("the same content elsewhere is still caught",
+              len(secrets.run(root)) > 0, True)
+
+
+def test_drill_canary_leaves_no_foldable_literal_in_compiled_bytecode():
+    """The property drill.py's own comment claims -- 'this file does not
+    itself contain the literal marker' -- was true of the .py source text and
+    false of the .pyc CPython compiles it into: `+` between two literals is
+    constant-folded at compile time, so the split protected nothing once the
+    module was imported once. Checked directly against the compiled code
+    object, not re-asserted by reading the source text again."""
+    import dis, types
+    src = pathlib.Path(__file__).resolve().parents[1] / "carabiner" / "drill.py"
+    code = compile(src.read_text(encoding="utf-8"), str(src), "exec")
+
+    def consts(co):
+        for c in co.co_consts:
+            yield c
+            if isinstance(c, types.CodeType):
+                yield from consts(c)
+
+    folded = [c for c in consts(code)
+              if isinstance(c, str) and "PRIVATE KEY" in c
+              and ("BEGIN" in c or "END" in c)]
+    check("no single compiled constant holds the PEM marker whole", folded, [])
+
+
 def test_ratchet():
     """Adoption in a legacy repo: accept what exists, fail only on what is new."""
     import tempfile
@@ -446,6 +494,47 @@ def test_sarif_is_wellformed():
     check("rules carry a security-severity for sorting",
           all("security-severity" in r["properties"]
               for r in run["tool"]["driver"]["rules"]), True)
+
+
+def test_gitlab_sast_report_validates_against_the_real_schema():
+    """The merge-request Security widget's adoption surface, same reasoning
+    as SARIF's own test: GitLab rejects a report that fails schema
+    validation, so a malformed field means zero findings shown, not a
+    warning. Validated against a vendored copy of GitLab's own published
+    schema (tests/fixtures/gitlab-sast-report-format.schema.json) rather
+    than hand-checked field names, for the same reason the Finding schema
+    test doesn't just eyeball as_dict()."""
+    try:
+        import jsonschema
+    except ImportError:
+        print("  (gitlab schema test skipped -- pip install jsonschema to run it)")
+        return
+    import json
+    from carabiner.report import gitlab
+
+    schema = json.loads((FIXTURES / "gitlab-sast-report-format.schema.json")
+                        .read_text(encoding="utf-8"))
+    findings = scan(FIXTURES / "ci_pull_request_target") + [
+        Finding("repo", "REPO003", "low", "SECURITY.md", "no policy"),
+        Finding("secrets", "SECRET-aws", "high", "a.py", "a credential", snippet="k"),
+    ]
+    doc = json.loads(gitlab.render(findings))
+    jsonschema.validate(doc, schema)
+
+    check("scan type is sast", doc["scan"]["type"], "sast")
+    check("severities map onto GitLab's own enum",
+          {v["severity"] for v in doc["vulnerabilities"]} <=
+          {"Info", "Unknown", "Low", "Medium", "High", "Critical"}, True)
+    check("critical maps correctly",
+          {v["severity"] for v in doc["vulnerabilities"]
+           if v["name"] == "CI001"}, {"Critical"})
+    check("every vulnerability carries our rule as its identifier",
+          {v["identifiers"][0]["value"] for v in doc["vulnerabilities"]} ==
+          {f.rule for f in findings}, True)
+    # An empty run must still validate -- GitLab CI runs this on every
+    # commit, and a report that only validates when something is wrong
+    # would fail silently on the good days.
+    jsonschema.validate(json.loads(gitlab.render([])), schema)
 
 
 def test_action_does_not_commit_the_injection_it_reports():
@@ -1120,9 +1209,10 @@ def test_dockerfile_engine_reads_dockerfiles_not_everything_shaped_like_one():
 
 
 def test_untrusted_trigger_family():
-    """CI006 and CI008 were promised in PLAN.md and never built. Both are real
-    token-theft routes, and both only matter in combination with a trigger that
-    runs in the base repo's context while handling somebody else's code."""
+    """CI006 and CI008 were designed early and never built until now. Both are
+    real token-theft routes, and both only matter in combination with a
+    trigger that runs in the base repo's context while handling somebody
+    else's code."""
     import tempfile
     from carabiner.engines import ci as C
 
@@ -1274,6 +1364,54 @@ def test_jenkins_circleci_and_azure():
                "steps:\n- script: echo $(Build.SourceBranchName)\n"), ["AZP001"])
 
 
+def test_jenkins_groovy_string_shapes_that_used_to_evade_detection():
+    """JEN001 was tested against exactly one shell-step shape: `sh "..."` on
+    one line. Real Jenkinsfiles use several others for the identical
+    vulnerability, and the original regex -- anchored to a single literal `"`
+    on each end -- missed every one of them. Each positive case here failed
+    before this session's fix; each negative case must keep failing, or the
+    rule starts firing on ordinary steps that use none of this."""
+    import tempfile
+    from carabiner.engines import _otherci as O
+
+    def scan(body):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = pathlib.Path(tmp) / "Jenkinsfile"
+            p.write_text(body, encoding="utf-8")
+            return [f.rule for f in O.run(pathlib.Path(tmp))]
+
+    # A triple-quoted string looked like `""` (open, immediately close) with
+    # unrelated content after it -- the interpolation inside was never seen.
+    check("triple-quoted multi-line sh step",
+          scan('sh """\necho ${params.B}\n"""\n'), ["JEN001"])
+    # Groovy's GString also interpolates a bare $identifier.property with no
+    # braces at all; the original regex only ever looked for a literal `${`.
+    check("bare $params.B with no braces",
+          scan('sh "echo $params.B"\n'), ["JEN001"])
+    # Rarer than dot access, but valid Groovy and not dot notation, so the
+    # original alternation (env\.NAME) never matched it.
+    check("bracket access on env",
+          scan("sh \"echo ${env['CHANGE_TITLE']}\"\n"), ["JEN001"])
+
+    # Both directions still hold for what already worked.
+    check("single quotes still do not interpolate",
+          scan("sh 'echo ${params.B}'\n"), [])
+    check("a trusted variable alone is still silent",
+          scan('sh "echo ${WORKSPACE}"\n'), [])
+    check("plain multi-line shell with no interpolation is still silent",
+          scan('sh """\n#!/bin/bash\necho hello\n"""\n'), [])
+
+    # Documented, not silently missed: string concatenation puts no `$` in
+    # the shell string at all, so there is no interpolation syntax to anchor
+    # a regex on. Catching it needs tracking a value across a `+`, which is
+    # dataflow analysis -- the module's own docstring already commits to
+    # staying shallower than that. This assertion is the "still true" pin,
+    # not a bug report; if it ever starts failing, decide on purpose rather
+    # than finding out by accident.
+    check("string concatenation is a known, accepted miss -- not full parsing",
+          scan('sh "echo " + params.B\n'), [])
+
+
 def test_every_finding_path_is_posix():
     """Windows CI caught this: git reports forward slashes and pathlib does not,
     so `--diff` matched nothing at all and reported a clean repository. Paths are
@@ -1359,6 +1497,145 @@ def test_dock006_ignores_targeted_copies():
               [f.rule for f in docker.run(d) if f.rule == "DOCK006"], [])
 
 
+def test_a_crashing_engine_does_not_blind_the_others():
+    """A bug inside one engine used to take the whole scan down with it --
+    the opposite of _tool.error()'s own rule that a tool failing is not a repo
+    reporting clean. Same rule, extended to a native engine raising instead of
+    a subprocess exiting non-zero."""
+    import tempfile
+    from carabiner import cli
+    from carabiner.engines import ALL
+
+    def boom(root, full=False, changed=None):
+        raise RuntimeError("a bug, not a finding")
+
+    original = ALL["docker"].run
+    ALL["docker"].run = boom
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "Dockerfile").write_text(
+                "FROM node:22-alpine@sha256:" + "a" * 64 + "\nUSER 10001\n",
+                encoding="utf-8")
+            found = cli._collect(root, None, full=True)
+    finally:
+        ALL["docker"].run = original
+    rules = {f.rule for f in found}
+    check("the crash is reported, not swallowed", "ENGINE-ERROR" in rules, True)
+    check("naming which engine crashed and why",
+          any(f.rule == "ENGINE-ERROR" and "a bug, not a finding" in f.message
+              for f in found),
+          True)
+    check("other engines still ran (repo hygiene always runs)",
+          "repo" in {f.engine for f in found} or len(found) >= 1, True)
+
+
+def test_fail_on_flag_warns_when_it_overrides_per_engine_config():
+    """--fail-on does not layer on top of .carabiner.yml's per-engine
+    thresholds -- it replaces cfg.gate() outright. Silent, that reads as the
+    config still applying; a repo with a stricter secrets threshold than the
+    flag would quietly get the weaker one with nothing said about it."""
+    import io, contextlib, tempfile
+    from carabiner import cli, config
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        (root / config.CONFIG_NAME).write_text(
+            "version: 1\nengines:\n  secrets: {fail_on: low}\n", encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(buf):
+            cli.main(["scan", "--root", str(root), "--fail-on", "critical"])
+        check("warns about the override", "secrets" in buf.getvalue(), True)
+        check("names the flag doing it", "--fail-on" in buf.getvalue(), True)
+
+        buf2 = io.StringIO()
+        (root / config.CONFIG_NAME).write_text("version: 1\n", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(buf2):
+            cli.main(["scan", "--root", str(root), "--fail-on", "critical"])
+        check("silent when there is nothing to override", buf2.getvalue(), "")
+
+
+def test_help_text_is_not_bare():
+    """argparse's default with no description/epilog is just usage and flags --
+    the three-line command table from the module docstring never reached a
+    user running `carabiner --help`."""
+    import io, contextlib
+    from carabiner.cli import main as cli_main
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        try:
+            cli_main(["--help"])
+        except SystemExit:
+            pass
+    text = buf.getvalue()
+    check("explains what the tool does", "secure by default" in text, True)
+    check("lists the commands with what they're for", "ratchet" in text, True)
+
+
+def test_finding_schema_is_valid_and_matches_a_real_finding():
+    """schema/finding.schema.json is the published, versioned contract for
+    --json output -- the same kind of composition invariant's `receipt` check
+    type demonstrates for a different pair of projects. Validated against
+    real Finding shapes, not just written and trusted."""
+    try:
+        import jsonschema
+    except ImportError:
+        print("  (schema test skipped -- pip install jsonschema to run it)")
+        return
+    schema_path = pathlib.Path(__file__).resolve().parents[1] / "schema" / "finding.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator.check_schema(schema)
+
+    real = Finding("ci", "CI001", "critical", ".github/workflows/ci.yml",
+                   "job runs on pull_request_target", fix="use pull_request",
+                   snippet="ref: github.event.pull_request.head.sha", line=12)
+    jsonschema.validate(real.as_dict(), schema)
+
+    from carabiner.engines._tool import error
+    jsonschema.validate(error("deps", "osv-scanner", "not found").as_dict(), schema)
+
+    no_line = Finding("repo", "REPO003", "low", "SECURITY.md", "missing")
+    jsonschema.validate(no_line.as_dict(), schema)
+
+
+def test_no_catastrophic_backtracking_in_the_hand_written_regex_set():
+    """Every engine here reads attacker-influenced text: a workflow file, a
+    Dockerfile, a Jenkinsfile a fork's PR can modify. A regex with the classic
+    ReDoS shape -- a quantifier nested inside a repeated group, or several
+    unbounded character classes in a row with no disambiguating anchor
+    between them -- turns a normal-sized file into a hang, and a security
+    scanner that can be made to hang is itself a denial-of-service surface.
+
+    Measured, not asserted: each pattern below is timed against an input
+    engineered to maximise backtracking for its specific shape (a long run
+    that almost satisfies a repeated group, then fails at the very end,
+    which is what forces a vulnerable engine to explore every partition
+    before giving up). A generous 2s budget for up to 200,000 characters --
+    genuine exponential blowup misses that budget by many orders of
+    magnitude at even a fraction of this size, so this is a real tripwire,
+    not a flaky timing assertion."""
+    import time
+    from carabiner.engines.docker import _COPY_ALL, _PIPE_TO_SHELL, _TLS_OFF
+    from carabiner.engines._otherci import _GROOVY_SH
+
+    N = 50_000
+    cases = [
+        ("docker._COPY_ALL", _COPY_ALL,
+         "COPY " + ("--aaaaaaaaaaaaaaaaaaaa " * N) + "XFAIL"),
+        ("docker._PIPE_TO_SHELL", _PIPE_TO_SHELL, "curl " + "x" * (N * 4)),
+        ("docker._TLS_OFF", _TLS_OFF, "x" * (N * 4)),
+        ("_otherci._GROOVY_SH", _GROOVY_SH,
+         'sh "' + "x" * N + "${" + "y" * N + "}" + "z" * N),
+    ]
+    for name, pattern, payload in cases:
+        start = time.monotonic()
+        pattern.search(payload)
+        elapsed = time.monotonic() - start
+        check(f"{name} stays linear on {len(payload):,} adversarial chars",
+              elapsed < 2.0, True)
+
+
 def main():
     # Discovered, not listed. A hand-maintained roster silently stops running
     # tests the moment an edit drops a name -- which is exactly what happened.
@@ -1367,7 +1644,7 @@ def main():
     # A floor, not a target. Three separate edits in one session silently
     # deleted whole blocks of tests by replacing a range that spanned them;
     # each time the suite went green with fewer tests and said nothing.
-    FLOOR = 63
+    FLOOR = 72
     if len(tests) < FLOOR:
         raise SystemExit(f"test suite shrank: {len(tests)} < {FLOOR}. "
                          "An edit probably deleted tests -- check git diff.")

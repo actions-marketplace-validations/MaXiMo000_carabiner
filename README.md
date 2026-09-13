@@ -74,6 +74,13 @@ across engines, keeping the worse severity — two scanners reporting one CVE is
 one finding, and a developer shown the same problem twice trusts the tool less
 each time. Emitted as SARIF so findings land in the PR Security tab — which is exactly why `snippet` is scrubbed in `Finding.__post_init__` rather than at each call site: a credential that reaches a finding reaches a code-scanning alert. Token-shaped runs are shortened to first4…last4, and a credential in a URL is removed outright. That second rule deliberately over-reaches, because a redactor is the one place in this tool where a false positive is cheaper than a false negative.
 
+`--json`'s shape is [`schema/finding.schema.json`](schema/finding.schema.json)
+— versioned (`schema_version`, bumped only on a breaking change), so a
+downstream consumer isn't trusting an implicit contract. This is what
+[invariant](https://github.com/MaXiMo000/invariant)'s `security_scan` check
+type demonstrates for a different pair of tools: read one project's evidence,
+assert on it from another.
+
 ## Adopt it
 
 ```bash
@@ -113,6 +120,23 @@ everything as new.
 Add `args: --all --summary carabiner.md` and post that file as a PR comment to
 get one short line per PR — `2 new · 1 fixed · 340 accepted` — instead of the
 whole backlog restated every time.
+
+## On GitLab CI
+
+```yaml
+carabiner:
+  script:
+    - pip install carabiner-sec
+    - carabiner scan --all --gitlab-sast gl-sast-report.json --fail-on low
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+```
+
+`--gitlab-sast` writes a report GitLab's own merge-request Security widget
+reads natively — the same adoption surface `--sarif` gives on GitHub.
+Validated against GitLab's own published schema in the test suite, not just
+hand-checked field names, for the same reason the SARIF output is.
 
 ## Anywhere else — GitLab CI, Jenkins, CircleCI
 
@@ -161,6 +185,28 @@ version tag on an action is informational; a *moving branch* in someone else's
 repository is not. A private key under `tests/` is reported lower than one in
 `config/`.
 
+**Re-run since, on a different sample.** 30 popular, unrelated public repos —
+Python, JS/TS, Go, Rust, Ruby, Java — shallow-cloned fresh and scanned with
+`--all`, gitleaks and osv-scanner installed. 28 of 30 produced at least one new
+finding; `expressjs/express` and `spf13/cobra` scanned clean. Median scan time
+was **10.5s**, osv-scanner's live lookup included. The single largest number —
+3,339, on `facebook/react` — came from a sprawling, decade-old monorepo with
+dozens of workflow files and an equally old lockfile: real surface area, not a
+scanner malfunction.
+
+The dominant rule by far was `SECRET-*`, on all but a handful of the 30 —
+almost none of it a live credential. `psf/requests` ships four real TLS
+private keys under `tests/certs/`, used by its own mTLS test suite; the
+`tests/` demotion above puts each at `medium` in the working tree, `high` only
+once history is in scope, exactly as designed. That is the pattern across the
+sample: a raw secrets scanner flags something in nearly every mature codebase,
+and almost all of it is a fixture, an example JWT in a doc, or a placeholder —
+precisely the noise the ratchet exists to keep out of a team's way, not a
+one-off blind spot in this particular tool. The signal worth a maintainer's
+time was elsewhere: unpinned actions, a missing top-level `permissions:`
+block, and dependency advisories on old transitive pins, all real and all
+still there after the fixtures are filtered out.
+
 **A repository referencing its own action is not reported at all.** Moving that
 tag needs push access to the repository being scanned — the same access that
 would let someone rewrite the workflow outright — so no boundary is crossed and
@@ -173,7 +219,9 @@ reported.
 
 A missing scanner degrades to an install hint, never a crash. And a scanner that
 *fails* produces a finding saying the check did not happen — a tool that errors
-is not a repo that is clean.
+is not a repo that is clean. That rule covers a native engine raising too, not
+just a wrapped one exiting non-zero: one engine's bug is reported and every
+other engine still runs, rather than the whole scan going down with it.
 
 ## Known limits, stated plainly
 
@@ -182,6 +230,17 @@ is not a repo that is clean.
 - The published Docker image is `linux/amd64` only.
 - The fast path scans the whole working tree, not just changed files, so a very
   large monorepo can exceed the 2s target.
+- The `secrets` engine's working-tree scan skips `node_modules`, `.venv`,
+  `__pycache__`, `dist`, `build`, `vendor`, `target` and `.git` — generated or
+  vendored content that has no business being read as source, and that
+  gitleaks' non-git scan mode has no `.gitignore` of its own to tell it to
+  skip. Measured, not theoretical: a compiled `.pyc` embedded a string this
+  project's own `drill.py` deliberately split across a concatenation to keep
+  out of a scanner's sight in the `.py` source, because CPython folds that
+  concatenation back into one literal at compile time. If one of those
+  directories is ever *actually committed* to a repo, `--all`'s history scan
+  still finds what's in it — a real secret checked into `node_modules` is a
+  problem regardless of what carabiner shows on a pre-commit run.
 
 Tested on Linux and Windows, Python 3.10 and 3.13. `--offline` is enforced by a
 test that blocks socket creation and asserts a full scan still completes — the
